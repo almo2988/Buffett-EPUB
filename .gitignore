@@ -1,0 +1,4 @@
+# The built book is for personal use and must not be committed.
+output/
+*.epub
+__pycache__/
