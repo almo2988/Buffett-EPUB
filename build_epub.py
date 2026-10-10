@@ -5,7 +5,9 @@ Downloads the Owner's Manual (the current edition, plus the January 1999 and
 original June 1996 editions, which still have the "Purchase-Accounting
 Adjustments" section and passages later cut) and the 1987, 1989, 2006, 2008
 and 2014 shareholder letters from berkshirehathaway.com, turns them into
-clean chapters and packages them as EPUB 3 (with an NCX for older readers).
+clean chapters and packages them as EPUB 3 (with an NCX for older readers),
+with every section in the table of contents and page numbers like a printed
+book's (about 300 words a page) in place of Kindle locations.
 
     pip install requests brotli pdfplumber pillow
     python3 build_epub.py [--cache DIR] [--out output/Buffett_Essentials.epub]
@@ -60,12 +62,15 @@ EDNOTES = {'owners1999': 'This January 1999 edition of the Owner\u2019s Manual i
                          'its passages appear in neither later edition, among them the opening paragraph of '
                          '\u201cOwner-Related Business Principles\u201d and a paragraph on look-through earnings '
                          'in \u201cPurchase-Accounting Adjustments.\u201d'}
-# Headings that also get their own (nested) entry in the table of contents;
-# in ESSAYS they open an essay, which starts on a new page.
-SUBTOC = {'owners1999': [r'^PURCHASE-ACCOUNTING ADJUSTMENTS$'],
-          'owners1996': [r'^PURCHASE-ACCOUNTING ADJUSTMENTS$'],
-          '2014': [r'Past, Present and Future', r'Vice Chairman']}
-ESSAYS = {'2014'}
+# Every section heading gets an entry under its chapter in the table of
+# contents. These headings open an essay, which starts on a new page; the
+# headings that follow it are the essay's sections, one level further down.
+ESSAYS = {'2014': [r'Past, Present and Future', r'Vice Chairman']}
+# The page numbers are those of an imaginary printed edition: pages of 34 lines
+# of about 64 characters (some 300 words of running text), with every chapter
+# and essay starting on a new page.
+PAGE_LINES = 34
+LINE_CHARS = 64
 # Descriptions (alt text) of the photographs in the PDFs, by (slug, page).
 PHOTOS = {('2014', 22): 'Photograph: Warren Buffett, in a red jacket, with Berkshire\u2019s home-office staff'}
 MAX_TABLE_CHARS = 50   # wider tables (in characters), or 5+ columns, become images
@@ -141,22 +146,35 @@ def space_style(a, b):
     return ''.join(f for f in 'bim' if f in a and f in b)
 
 
-def to_html(tokens):
-    parts = []
+def styled_html(t, st):
+    if st.startswith('R:'):
+        _, fid, n = st.split(':')
+        return f'<a class="nref" epub:type="noteref" id="r-{fid}-{n}" href="#{fid}">{esc(t)}</a>'
+    if st == 'br':
+        return '<br/>'
+    h = esc(t)
+    for flag, tag in (('S', 'sup'), ('s', 'sub'), ('m', 'small'), ('i', 'i'), ('b', 'b')):
+        if flag in st:
+            h = f'<{tag}>{h}</{tag}>'
+    return h
+
+
+def to_html(tokens, marks=()):
+    """marks: (offset, html) pairs, html to insert at that character of
+    plain(tokens) (page-break markers). Note references are never split."""
+    marks = sorted(marks, key=lambda m: m[0])
+    parts, pos = [], 0
     for t, st in merge(tokens):
-        if st.startswith('R:'):
-            _, fid, n = st.split(':')
-            parts.append(f'<a class="nref" epub:type="noteref" id="r-{fid}-{n}" href="#{fid}">{esc(t)}</a>')
-            continue
-        if st == 'br':
-            parts.append('<br/>')
-            continue
-        h = esc(t)
-        for flag, tag in (('S', 'sup'), ('s', 'sub'), ('m', 'small'), ('i', 'i'), ('b', 'b')):
-            if flag in st:
-                h = f'<{tag}>{h}</{tag}>'
-        parts.append(h)
-    return ''.join(parts)
+        start = 0
+        while marks and marks[0][0] < pos + len(t):
+            k = 0 if st.startswith('R:') or st == 'br' else max(0, marks[0][0] - pos)
+            if k > start:
+                parts.append(styled_html(t[start:k], st))
+                start = k
+            parts.append(marks.pop(0)[1])
+        parts.append(styled_html(t[start:], st))
+        pos += len(t)
+    return ''.join(parts + [h for _, h in marks])
 
 
 VOCAB = Counter()   # words seen in the sources, used to decide line-end hyphens
@@ -1410,14 +1428,74 @@ def cover_image():
 
 
 # --------------------------------------------------------------------------
+# Page numbers: the book is laid out on imaginary printed pages (PAGE_LINES),
+# and a page-break marker goes where each page would begin. The page list in
+# the navigation lets Kindle show "Page 12 of 340" instead of locations.
+# --------------------------------------------------------------------------
+
+def line_starts(text, width):
+    """Offsets at which the lines of `text` begin when it is wrapped at
+    `width` characters and at forced line breaks."""
+    starts, base = [], 0
+    for seg in text.split('\n'):
+        line = None
+        for w in re.finditer(r'\S+', seg):
+            if line is None or w.end() - line > width:
+                line = w.start()
+                starts.append(base + line)
+        base += len(seg) + 1
+    return starts or [0]
+
+
+class Pager:
+    """Tracks the imaginary page being filled. Each method takes the next
+    piece of the book and returns the page-break markers that go in it."""
+
+    def __init__(self):
+        self.page, self.used, self.href = 0, 0.0, None
+        self.pages = []     # (chapter file, marker id, page number)
+
+    def new_page(self):
+        self.page += 1
+        self.used = 0.0
+        pid = f'page{self.page}'
+        self.pages.append((self.href, pid, self.page))
+        return f'<span epub:type="pagebreak" role="doc-pagebreak" id="{pid}" aria-label="{self.page}"></span>'
+
+    def block(self, lines, keep=0.0):
+        """Something that is not split across pages (a heading, a picture, a
+        table row) and `keep` lines that must follow it on the same page:
+        its marker if it starts a page, else ''."""
+        mark = self.new_page() if self.used and self.used + lines + keep > PAGE_LINES else ''
+        self.used += min(lines, PAGE_LINES)
+        return mark
+
+    def text(self, text, size=1.0, indent=0, space=0.5):
+        """A paragraph in type `size` times the body's, indented by `indent`
+        characters and followed by `space` blank lines: (offset, marker) of
+        each page that begins in it."""
+        marks = []
+        for start in line_starts(text, LINE_CHARS / size - indent):
+            if self.used + size > PAGE_LINES:
+                marks.append((start, self.new_page()))
+            self.used += size
+        self.used += space * size
+        return marks
+
+    def heading(self, text, size=1.12):
+        """A heading, kept with the first lines of what follows it."""
+        return self.block(size * len(line_starts(text, LINE_CHARS / size)) + 2, keep=2)
+
+
+# --------------------------------------------------------------------------
 # XHTML
 # --------------------------------------------------------------------------
 
 CSS = """
 body { margin: 0; padding: 0; }
 h1 { font-size: 1.5em; text-align: center; margin: 1.5em 0 1.2em 0; page-break-before: always; }
-h2 { font-size: 1.12em; margin: 1.4em 0 0.6em 0; page-break-after: avoid; }
-h2.center, h2.essay { text-align: center; }
+h2, h3 { font-size: 1.12em; margin: 1.4em 0 0.6em 0; page-break-after: avoid; }
+h2.center, h3.center, h2.essay { text-align: center; }
 h2.essay { font-size: 1.3em; margin-top: 2.5em; page-break-before: always; }
 p { margin: 0 0 0.5em 0; text-indent: 1.3em; }
 p.noindent, p.center, p.tsrc, p.tnotes, p.sep, .sig p, .li p, .notes p, nav p { text-indent: 0; }
@@ -1455,9 +1533,12 @@ a.nref { text-decoration: none; }
 .notes p { font-size: 0.9em; margin-bottom: 0.6em; }
 div.cover { text-align: center; margin: 0; padding: 0; }
 div.cover img { height: 97%; max-width: 100%; }
+nav[hidden] { display: none; }
 nav ol { list-style-type: none; margin-left: 0; padding-left: 0; }
 nav ol ol { margin-left: 1.5em; }
-nav li { margin: 0.4em 0; }
+nav li { margin: 1em 0 0.3em 0; font-weight: bold; }
+nav li li { margin: 0.3em 0; font-size: 0.9em; font-weight: normal; }
+nav li li li { font-size: 1em; }
 """
 
 
@@ -1469,7 +1550,10 @@ def xhtml(title, body, css='style.css'):
             f'</head>\n<body>\n{body}\n</body>\n</html>\n')
 
 
-def table_html(t):
+def table_html(t, marks=None):
+    """marks: page-break markers for the first cell of a body row, by row
+    number, or of the headings (-1)."""
+    marks = marks or {}
     out = ['<table class="data">']
     if t.header:
         out.append('<thead>')
@@ -1480,7 +1564,8 @@ def table_html(t):
                 cls = (['stub'] if c0 == 0 and c1 == 0 and not t.numeric[0] else []) + \
                       (['last'] if k == len(t.header) - 1 and plain(toks).strip() else [])   # rule under headings only
                 cls = f' class="{" ".join(cls)}"' if cls else ''
-                cells.append(f'<th{span}{cls}>{to_html(toks)}</th>')
+                lead = marks.pop(-1, '') if not cells else ''
+                cells.append(f'<th{span}{cls}>{lead}{to_html(toks)}</th>')
             out.append('<tr>' + ''.join(cells) + '</tr>')
         out.append('</thead>')
     out.append('<tbody>')
@@ -1493,69 +1578,106 @@ def table_html(t):
             attr = f' class="{" ".join(cls)}"' if cls else ''
             if is_num(plain(toks)):   # "$   965" is aligned type; in a cell it is "$965"
                 toks = merge([(re.sub(r'^\$\s+', '$', x) if k == 0 else x, st) for k, (x, st) in enumerate(toks)])
-            cells.append(f'<td{attr}>{to_html(toks)}</td>')
+            lead = marks.get(r, '') if c == 0 else ''
+            cells.append(f'<td{attr}>{lead}{to_html(toks)}</td>')
         out.append(('<tr class="gap">' if r in t.gaps else '<tr>') + ''.join(cells) + '</tr>')
     out.append('</tbody>\n</table>')
     return '\n'.join(out)
 
 
-def chapter_html(ch, images):
-    """Render one chapter; wide tables are added to `images` as PNGs."""
-    slug, parts, sub = ch['slug'], [f'<section epub:type="chapter" id="c-{ch["slug"]}">',
-                                     f'<h1>{esc(ch["title"])}</h1>'], []
+SMALL_WORDS = {'a', 'an', 'and', 'as', 'at', 'by', 'for', 'in', 'of', 'on', 'or', 'the', 'to', 'vs.'}
+
+
+def toc_label(text):
+    """A heading as an entry in the table of contents: on one line, and in
+    title case if it is set in capitals."""
+    words = text.split()
+    if text.isupper():
+        words = [w.lower() if k and w.lower() in SMALL_WORDS else
+                 '-'.join(p[:1] + p[1:].lower() for p in w.split('-')) for k, w in enumerate(words)]
+    return ' '.join(words)
+
+
+def chapter_html(ch, images, pager):
+    """Render one chapter, laid out on `pager`'s pages; wide tables are added
+    to `images` as PNGs. Also returns the chapter's headings for the table of
+    contents as (id, label, level): level 2 under the chapter, 3 in an essay."""
+    slug, sub, essay = ch['slug'], [], False
+    parts = [f'<section epub:type="chapter" id="c-{slug}">', f'<h1>{pager.new_page()}{esc(ch["title"])}</h1>']
+    pager.block(6)   # a chapter opens a third of the way down its page
     if slug in EDNOTES:
-        parts.append(f'<p class="ednote">{esc(EDNOTES[slug])}</p>')
+        marks = pager.text(EDNOTES[slug], 0.88, indent=6, space=1.5)
+        parts.append(f'<p class="ednote">{to_html([(EDNOTES[slug], "")], marks)}</p>')
     for k, b in enumerate(ch['blocks']):
         t = b['t']
         if t == 'p':
             cls = f' class="{b["cls"]}"' if b.get('cls') else ''
-            parts.append(f'<p{cls}>{to_html(b["tok"])}</p>')
+            small = re.search(r'\b(small|tsrc)\b', b.get('cls', ''))
+            marks = pager.text(plain(b['tok']), 0.88 if small else 1)
+            parts.append(f'<p{cls}>{to_html(b["tok"], marks)}</p>')
         elif t == 'h2':
-            hid = f'h-{slug}-{k}'
+            hid, tag = f'h-{slug}-{k}', 'h2'
             text = plain(b['tok'])
             cls = b.get('cls', '')
-            if any(re.search(p, text) for p in SUBTOC.get(slug, [])):
-                sub.append((hid, text.title() if text.isupper() else text))
-                if slug in ESSAYS:
-                    cls = 'essay'
+            if any(re.search(p, text) for p in ESSAYS.get(slug, [])):
+                essay, cls, level = True, 'essay', 2
+                mark = pager.new_page() + pager.heading(text, 1.3)
+            else:
+                tag, level = ('h3', 3) if essay else ('h2', 2)
+                mark = pager.heading(text)
+            sub.append((hid, toc_label(text), level))
             cls = f' class="{cls}"' if cls else ''
-            parts.append(f'<h2 id="{hid}"{cls}>{to_html(b["tok"])}</h2>')
+            parts.append(f'<{tag} id="{hid}"{cls}>{mark}{to_html(b["tok"])}</{tag}>')
         elif t == 'li':
-            paras = [f'<p class="first"><span class="mk">{esc(b["marker"])} </span>{to_html(b["paras"][0])}</p>']
-            paras += [f'<p class="quote">{to_html(p)}</p>' if i in b.get('quotes', ()) else f'<p>{to_html(p)}</p>'
-                      for i, p in enumerate(b['paras'][1:], 1)]
+            indent = 4 * (1 + min(b.get('level', 0), 1))
+            marks = [pager.text(plain(p), indent=indent + 4 * (i in b.get('quotes', ())))
+                     for i, p in enumerate(b['paras'])]
+            paras = [f'<p class="first"><span class="mk">{esc(b["marker"])} </span>'
+                     f'{to_html(b["paras"][0], marks[0])}</p>']
+            paras += [f'<p class="quote">{to_html(p, marks[i])}</p>' if i in b.get('quotes', ()) else
+                      f'<p>{to_html(p, marks[i])}</p>' for i, p in enumerate(b['paras'][1:], 1)]
             parts.append(f'<div class="li lv{min(b.get("level", 0), 1)}">' + ''.join(paras) + '</div>')
         elif t == 'sep':
-            parts.append('<p class="sep">*\u2003*\u2003*</p>')
+            parts.append(f'<p class="sep">{pager.block(2)}*\u2003*\u2003*</p>')
         elif t == 'img':
             name = f'{slug}-photo{sum(n.startswith(slug + "-photo") for n in images) + 1}.jpg'
             images[name] = photo_bytes(*b['src'])
             alt = PHOTOS.get((slug, b['page'] + 1), 'Photograph')
-            parts.append(f'<div class="photo"><img src="../images/{name}" alt="{esc(alt)}"/></div>')
+            parts.append(f'<div class="photo">{pager.block(14)}<img src="../images/{name}" alt="{esc(alt)}"/></div>')
         elif t == 'sig':
             lines = '<br/>'.join(esc(x) for x in b['lines'])
             date = f'<p class="date">{esc(b["date"])}</p>' if b['date'] else ''
-            parts.append(f'<div class="sig">{date}<p class="name">{lines}</p></div>')
+            mark = pager.block(len(b['lines']) + bool(b['date']) + 1.5)
+            parts.append(f'<div class="sig">{mark}{date}<p class="name">{lines}</p></div>')
         elif t == 'table':
             tb = b['table']
             if tb.wide:
                 name = f'{slug}-table{sum("-table" in n for n in images) + 1}.png'
                 images[name] = png_bytes(table_image(tb))
-                parts.append(f'<div class="tableimg"><img src="../images/{name}" alt="{esc("Table: " + tb.plain_text())}"/></div>')
+                mark = pager.block(min(PAGE_LINES, 0.8 * (len(tb.header) + len(tb.rows)) + 2))
+                parts.append(f'<div class="tableimg">{mark}<img src="../images/{name}" '
+                             f'alt="{esc("Table: " + tb.plain_text())}"/></div>')
                 if tb.notes:   # the image cannot link its asterisks, so link them here
                     refs = []
                     for n in tb.notes:
                         n['refs'].append(n['id'])
                         refs.append(f'<a class="nref" epub:type="noteref" id="r-{n["id"]}-{len(n["refs"])}" '
                                     f'href="#{n["id"]}">{esc(n["marker"])}</a>')
-                    parts.append(f'<p class="tnotes">Table notes: {" ".join(refs)}</p>')
-            else:
-                parts.append(table_html(tb))
+                    parts.append(f'<p class="tnotes">{pager.block(1.5)}Table notes: {" ".join(refs)}</p>')
+            else:   # rows are not split; the headings stay with the first rows
+                marks = {-1: pager.block(len(tb.header) + 1, keep=2)} if tb.header else {}
+                for r, row in enumerate(tb.rows):
+                    text = ' '.join(plain(c).strip() for c in row)
+                    lines = 0.85 * len(line_starts(text, LINE_CHARS / 0.85)) + 0.7 * (r in tb.gaps)
+                    marks[r] = pager.block(lines + (not tb.header and r == 0))
+                pager.used += 1
+                parts.append(table_html(tb, marks))
     if ch['notes']:
-        parts.append('<section class="notes">\n<h2>Notes</h2>')
+        parts.append(f'<section class="notes">\n<h2>{pager.block(4, keep=2)}Notes</h2>')
         for n in ch['notes']:
             back = f'<a href="#r-{n["id"]}-1">{esc(n["marker"])}</a>' if n['refs'] else esc(n['marker'])
-            parts.append(f'<p id="{n["id"]}">{back} {to_html(n["tok"])}</p>')
+            marks = pager.text(plain(n['tok']), 0.9, space=0.6)
+            parts.append(f'<p id="{n["id"]}">{back} {to_html(n["tok"], marks)}</p>')
         parts.append('</section>')
     parts.append('</section>')
     return xhtml(ch['title'], '\n'.join(parts), '../style.css'), sub
@@ -1565,38 +1687,66 @@ def chapter_html(ch, images):
 # EPUB packaging
 # --------------------------------------------------------------------------
 
+def toc_tree(entries):
+    """Nest (level, href, label) entries, in reading order, into a tree of
+    (href, label, children)."""
+    root, open_ = [], []   # open_: (level, node) from the outermost in
+    for level, href, label in entries:
+        while open_ and open_[-1][0] >= level:
+            open_.pop()
+        node = (href, label, [])
+        (open_[-1][1][2] if open_ else root).append(node)
+        open_.append((level, node))
+    return root
+
+
+def nav_ol(nodes):
+    return '<ol>\n' + '\n'.join(f'<li><a href="{h}">{esc(label)}</a>{nav_ol(kids) if kids else ""}</li>'
+                                 for h, label, kids in nodes) + '\n</ol>'
+
+
 def write_epub(chapters, out_path):
-    images, docs, toc = {}, [], []
+    images, docs, toc, pager = {}, [], [], Pager()
     for i, ch in enumerate(chapters, 1):
-        body, sub = chapter_html(ch, images)
-        docs.append((f'text/ch{i}.xhtml', body))
-        toc.append((f'text/ch{i}.xhtml', ch['title'], sub))
+        href = pager.href = f'text/ch{i}.xhtml'
+        body, sub = chapter_html(ch, images, pager)
+        docs.append((href, body))
+        toc.append((1, href, ch['title']))
+        toc += [(level, f'{href}#{hid}', label) for hid, label, level in sub]
+    tree = toc_tree(toc)
+    pages = [(f'{href}#{pid}', n) for href, pid, n in pager.pages]
     book_id = 'urn:uuid:' + str(uuid.uuid5(uuid.NAMESPACE_URL, SITE + '#' + TITLE))
     modified = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    items = []
-    for href, title, sub in toc:
-        inner = ''.join(f'<li><a href="{href}#{hid}">{esc(t)}</a></li>' for hid, t in sub)
-        items.append(f'<li><a href="{href}">{esc(title)}</a>' + (f'<ol>{inner}</ol>' if inner else '') + '</li>')
-    nav = xhtml('Contents', '<nav epub:type="toc" id="toc">\n<h1>Contents</h1>\n<ol>\n' + '\n'.join(items) +
-                '\n</ol>\n</nav>\n<nav epub:type="landmarks" hidden="hidden">\n<ol>\n'
+    nav = xhtml('Contents', '<nav epub:type="toc" id="toc">\n<h1>Contents</h1>\n' + nav_ol(tree) + '\n</nav>\n'
+                '<nav epub:type="page-list" id="page-list" hidden="hidden">\n<ol>\n' +
+                '\n'.join(f'<li><a href="{src}">{n}</a></li>' for src, n in pages) + '\n</ol>\n</nav>\n'
+                '<nav epub:type="landmarks" hidden="hidden">\n<ol>\n'
                 '<li><a epub:type="cover" href="cover.xhtml">Cover</a></li>\n'
                 '<li><a epub:type="toc" href="nav.xhtml#toc">Contents</a></li>\n'
                 f'<li><a epub:type="bodymatter" href="{docs[0][0]}">Start</a></li>\n</ol>\n</nav>')
-    points, order = [], 0
-    for href, title, sub in toc:
-        order += 1
-        kids = ''
-        for hid, t in sub:
-            order += 1
-            kids += (f'<navPoint id="np{order}" playOrder="{order}"><navLabel><text>{esc(t)}</text></navLabel>'
-                     f'<content src="{href}#{hid}"/></navPoint>')
-        points.append(f'<navPoint id="np{order - len(sub)}" playOrder="{order - len(sub)}"><navLabel><text>'
-                      f'{esc(title)}</text></navLabel><content src="{href}"/>{kids}</navPoint>')
+    # The NCX numbers its entries and pages together, in reading order.
+    where = {}
+    for d, (href, body) in enumerate(docs):
+        where[href] = (d, -1)
+        where.update({f'{href}#{m.group(1)}': (d, m.start()) for m in re.finditer(r'\sid="([^"]+)"', body)})
+    order = {src: k for k, src in enumerate(sorted({h for _, h, _ in toc} | {src for src, _ in pages},
+                                                   key=lambda src: where[src]), 1)}
+
+    def nav_points(nodes):
+        return ''.join(f'<navPoint id="np{order[h]}" playOrder="{order[h]}"><navLabel><text>{esc(label)}</text>'
+                       f'</navLabel><content src="{h}"/>{nav_points(kids)}</navPoint>' for h, label, kids in nodes)
     ncx = ('<?xml version="1.0" encoding="utf-8"?>\n<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
-           f'<head><meta name="dtb:uid" content="{book_id}"/><meta name="dtb:depth" content="2"/>'
-           '<meta name="dtb:totalPageCount" content="0"/><meta name="dtb:maxPageNumber" content="0"/></head>\n'
-           f'<docTitle><text>{esc(TITLE)}</text></docTitle>\n<navMap>\n' + '\n'.join(points) + '\n</navMap>\n</ncx>\n')
+           f'<head><meta name="dtb:uid" content="{book_id}"/>'
+           f'<meta name="dtb:depth" content="{max(level for level, _, _ in toc)}"/>'
+           f'<meta name="dtb:totalPageCount" content="{len(pages)}"/>'
+           f'<meta name="dtb:maxPageNumber" content="{len(pages)}"/></head>\n'
+           f'<docTitle><text>{esc(TITLE)}</text></docTitle>\n<navMap>\n' +
+           '\n'.join(nav_points([node]) for node in tree) + '\n</navMap>\n'
+           '<pageList><navLabel><text>Pages</text></navLabel>\n' +
+           '\n'.join(f'<pageTarget id="pt{n}" type="normal" value="{n}" playOrder="{order[src]}"><navLabel>'
+                     f'<text>{n}</text></navLabel><content src="{src}"/></pageTarget>' for src, n in pages) +
+           '\n</pageList>\n</ncx>\n')
     cover = xhtml('Cover', f'<div class="cover"><img src="images/cover.png" alt="{esc(TITLE)} by {esc(AUTHOR)}"/></div>')
 
     manifest = ['<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
@@ -1642,7 +1792,7 @@ def write_epub(chapters, out_path):
         files += [('OEBPS/images/' + name, data) for name, data in images.items()]
         for name, data in files:
             z.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
-    return docs, images
+    return docs, images, len(pages)
 
 
 # --------------------------------------------------------------------------
@@ -1746,9 +1896,9 @@ def main():
             blocks, notes = parse_pre(raw) if is_pre_letter(raw) else parse_html(raw)
         link_notes(slug, blocks, notes)
         chapters.append({'slug': slug, 'title': title, 'blocks': blocks, 'notes': notes})
-    docs, images = write_epub(chapters, args.out)
+    docs, images, pages = write_epub(chapters, args.out)
     tables = [b['table'] for ch in chapters for b in ch['blocks'] if b['t'] == 'table']
-    print(f'Wrote {args.out}: {len(chapters)} chapters, {sum(not t.wide for t in tables)} HTML tables, '
+    print(f'Wrote {args.out}: {len(chapters)} chapters, {pages} pages, {sum(not t.wide for t in tables)} HTML tables, '
           f'{sum("-table" in n for n in images)} tables as images, '
           f'{sum("-photo" in n for n in images)} photograph(s), {sum(len(ch["notes"]) for ch in chapters)} footnotes')
     joined = [h for h in HYPHEN_LOG if h.endswith('joined')]

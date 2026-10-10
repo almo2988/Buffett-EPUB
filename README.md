@@ -19,9 +19,11 @@ Berkshire's website when you run it and builds the EPUB on your computer.
   [2014](https://www.berkshirehathaway.com/letters/2014ltr.pdf)
 
 Tables are kept as tables (or as images when too wide for an e-reader screen),
-footnotes are linked, and the table of contents has entries for the main
-sections. After building, the script compares every chapter word by word with
-its source and reports anything missing.
+footnotes are linked, and the table of contents lists every section of each
+letter under its chapter. The book has page numbers like a printed edition's
+(about 300 words a page, some 340 pages in all), so an e-reader can show
+"Page 57 of 341" instead of a location. After building, the script compares
+every chapter word by word with its source and reports anything missing.
 
 ## Build it
 
@@ -38,7 +40,11 @@ The book is written to `output/Buffett_Essentials.epub` next to the script. Opti
 - `--cache DIR`: where the downloaded sources are kept (default `~/.cache/buffett-epub`)
 
 To read it on a Kindle, use [Send to Kindle](https://www.amazon.com/sendtokindle),
-which accepts EPUB files.
+which accepts EPUB files. To see page numbers, tap the bottom-left corner of
+the page while reading until it shows "Page". If that option never appears,
+Amazon's conversion dropped the page numbers; calibre with the
+[KFX Output plugin](https://www.mobileread.com/forums/showthread.php?t=272407)
+keeps them: convert the EPUB to KFX and copy it to the Kindle over USB.
 
 ## Copyright
 
